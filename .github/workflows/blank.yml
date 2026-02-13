@@ -91,7 +91,7 @@ jobs:
 
             encoded_name=$(printf '%s' "$f" | jq -s -R -r @uri)
 
-            curl --progress-bar \
+            curl --globoff --progress-bar \
                  -T "$f" \
                  "https://filebin.net/$BIN_NAME/$encoded_name"
           done
