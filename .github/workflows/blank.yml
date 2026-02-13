@@ -30,7 +30,7 @@ jobs:
       - name: Show initial disk space
         run: df -h
 
-      - name: Download torrent (Optimized)
+      - name: Download torrent (Optimized + Logged)
         run: |
           cd work/download
           echo "Starting torrent download..."
@@ -56,25 +56,25 @@ jobs:
       - name: Show disk usage after download
         run: df -h
 
-      - name: Direct Split (No Compression)
+      - name: Recursive Direct Split (Low Disk Mode)
         run: |
           cd work
 
-          echo "Starting direct split..."
+          echo "Starting recursive split..."
 
-          for file in download/*; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file")
-              echo "Splitting $filename ..."
+          find download -type f ! -name "*.torrent" | while read file; do
+            relpath=${file#download/}
+            safe_name=$(echo "$relpath" | tr '/' '_')
 
-              split -b ${{ github.event.inputs.split_size }} \
-                    --numeric-suffixes=1 \
-                    --suffix-length=4 \
-                    "$file" "splits/${filename}.part."
+            echo "Splitting $relpath ..."
 
-              echo "Deleting original file to free space..."
-              rm "$file"
-            fi
+            split -b ${{ github.event.inputs.split_size }} \
+                  --numeric-suffixes=1 \
+                  --suffix-length=4 \
+                  "$file" "splits/${safe_name}.part."
+
+            echo "Deleting original file to free space..."
+            rm "$file"
           done
 
           echo "Split parts created:"
