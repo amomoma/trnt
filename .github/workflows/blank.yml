@@ -21,7 +21,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2 curl coreutils
-
+          sudo apt-get install -y aria2 curl coreutils jq
       - name: Prepare workspace
         run: |
           mkdir -p work/download
@@ -88,7 +88,12 @@ jobs:
 
           for f in *; do
             echo "Uploading $f ..."
-            curl --progress-bar -T "$f" "https://filebin.net/$BIN_NAME/$f"
+
+            encoded_name=$(printf '%s' "$f" | jq -s -R -r @uri)
+
+            curl --progress-bar \
+                 -T "$f" \
+                 "https://filebin.net/$BIN_NAME/$encoded_name"
           done
 
           echo ""
