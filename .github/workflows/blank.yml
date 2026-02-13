@@ -1,0 +1,99 @@
+name: Large Torrent → Direct Split → Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      torrent_source:
+        description: "Magnet link OR .torrent URL"
+        required: true
+      split_size:
+        description: "Split size (e.g. 1G, 500M)"
+        required: false
+        default: "1G"
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 curl coreutils
+
+      - name: Prepare workspace
+        run: |
+          mkdir -p work/download
+          mkdir -p work/splits
+
+      - name: Show initial disk space
+        run: df -h
+
+      - name: Download torrent (Optimized)
+        run: |
+          cd work/download
+          echo "Starting torrent download..."
+
+          aria2c \
+            --dir=. \
+            --file-allocation=none \
+            --seed-time=0 \
+            --enable-dht=true \
+            --bt-enable-lpd=true \
+            --bt-save-metadata=true \
+            --bt-max-peers=100 \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=10M \
+            --summary-interval=30 \
+            --console-log-level=notice \
+            "${{ github.event.inputs.torrent_source }}"
+
+          echo "Download finished."
+          ls -lh
+
+      - name: Show disk usage after download
+        run: df -h
+
+      - name: Direct Split (No Compression)
+        run: |
+          cd work
+
+          echo "Starting direct split..."
+
+          for file in download/*; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              echo "Splitting $filename ..."
+
+              split -b ${{ github.event.inputs.split_size }} \
+                    --numeric-suffixes=1 \
+                    --suffix-length=4 \
+                    "$file" "splits/${filename}.part."
+
+              echo "Deleting original file to free space..."
+              rm "$file"
+            fi
+          done
+
+          echo "Split parts created:"
+          ls -lh splits
+
+      - name: Upload to Filebin
+        run: |
+          cd work/splits
+          BIN_NAME="github-$(date +%s)"
+          echo "Uploading to Filebin: $BIN_NAME"
+
+          for f in *; do
+            echo "Uploading $f ..."
+            curl --progress-bar -T "$f" "https://filebin.net/$BIN_NAME/$f"
+          done
+
+          echo ""
+          echo "======================================"
+          echo "✅ Upload complete!"
+          echo "Download link:"
+          echo "https://filebin.net/$BIN_NAME"
+          echo "======================================"
