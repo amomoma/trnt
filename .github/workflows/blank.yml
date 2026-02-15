@@ -56,30 +56,29 @@ jobs:
       - name: Show disk usage after download
         run: df -h
 
-      - name: Direct Split (No Compression)
+      - name: Direct Split (Recursive, No Compression)
         run: |
           cd work
+          echo "Starting recursive split..."
 
-          echo "Starting direct split..."
+          # Find all files in the 'download' directory and process them
+          find download -type f | while read -r file; do
+            # Remove leading "download/" from path to preserve folder structure
+            rel_path="${file#download/}"
 
-          for file in download/*; do
-            if [ -f "$file" ]; then
-              # Get relative path of the file (excluding the base directory)
-              file_path=$(dirname "$file")
-              filename=$(basename "$file")
+            # Convert folder separators (/) to underscores (_) for safe naming
+            safe_name=$(echo "$rel_path" | sed 's|/|_|g')
 
-              # Create a unique identifier using folder name + file name
-              base_name=$(basename "$file_path")-$(basename "$file")
-              echo "Splitting $filename ..."
+            echo "Splitting $rel_path ..."
 
-              split -b ${{ github.event.inputs.split_size }} \
-                    --numeric-suffixes=1 \
-                    --suffix-length=4 \
-                    "$file" "splits/${base_name}.part."
+            # Split the file into chunks based on the split_size input
+            split -b ${{ github.event.inputs.split_size }} \
+                  --numeric-suffixes=1 \
+                  --suffix-length=4 \
+                  "$file" "splits/${safe_name}.part."
 
-              echo "Deleting original file to free space..."
-              rm "$file"
-            fi
+            echo "Deleting original file..."
+            rm "$file"
           done
 
           echo "Split parts created:"
@@ -91,17 +90,10 @@ jobs:
           BIN_NAME="github-$(date +%s)"
           echo "Uploading to Filebin: $BIN_NAME"
 
-          # Loop through each file and upload it with a unique name
+          # Upload each split file to Filebin with the correct names
           for file in *; do
-            if [ -f "$file" ]; then
-              # Extract the folder name and create a unique file name
-              folder_name=$(dirname "$file" | sed 's|/|_|g')  # Replace '/' with '_'
-              new_filename="${folder_name}_${file}"
-              echo "Uploading $file as $new_filename ..."
-
-              # Upload the file with the unique name
-              curl --progress-bar -T "$file" "https://filebin.net/$BIN_NAME/$new_filename"
-            fi
+            echo "Uploading $file ..."
+            curl --progress-bar -T "$file" "https://filebin.net/$BIN_NAME/$file"
           done
 
           echo ""
