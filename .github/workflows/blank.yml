@@ -1,4 +1,4 @@
-name: Large Torrent → Direct Split → Upload
+name: Large Torrent → Direct Split → Upload (Structured)
 
 on:
   workflow_dispatch:
@@ -20,8 +20,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 curl coreutils
           sudo apt-get install -y aria2 curl coreutils jq
+
       - name: Prepare workspace
         run: |
           mkdir -p work/download
@@ -51,49 +51,51 @@ jobs:
             "${{ github.event.inputs.torrent_source }}"
 
           echo "Download finished."
-          ls -lh
+          ls -Rlh
 
       - name: Show disk usage after download
         run: df -h
 
-      - name: Recursive Direct Split (Low Disk Mode)
+      - name: Recursive Direct Split (Preserve Structure)
         run: |
           cd work
-
-          echo "Starting recursive split..."
+          echo "Starting recursive split with structure preservation..."
 
           find download -type f ! -name "*.torrent" | while read file; do
-            relpath=${file#download/}
-            safe_name=$(echo "$relpath" | tr '/' '_')
+            relpath="${file#download/}"
+            target_dir="splits/$(dirname "$relpath")"
+
+            mkdir -p "$target_dir"
 
             echo "Splitting $relpath ..."
 
             split -b ${{ github.event.inputs.split_size }} \
                   --numeric-suffixes=1 \
                   --suffix-length=4 \
-                  "$file" "splits/${safe_name}.part."
+                  "$file" "$target_dir/$(basename "$relpath").part."
 
             echo "Deleting original file to free space..."
             rm "$file"
           done
 
-          echo "Split parts created:"
-          ls -lh splits
+          echo "Split structure:"
+          ls -Rlh splits
 
-      - name: Upload to Filebin
+      - name: Upload to Filebin (Preserve Paths)
         run: |
           cd work/splits
           BIN_NAME="github-$(date +%s)"
           echo "Uploading to Filebin: $BIN_NAME"
 
-          for f in *; do
-            echo "Uploading $f ..."
+          find . -type f | while read f; do
+            clean_path="${f#./}"
+            encoded_path=$(printf '%s' "$clean_path" | jq -s -R -r @uri)
 
-            encoded_name=$(printf '%s' "$f" | jq -s -R -r @uri)
+            echo "Uploading $clean_path ..."
 
             curl --globoff --progress-bar \
-                 -T "$f" \
-                 "https://filebin.net/$BIN_NAME/$encoded_name"
+                 -T "$clean_path" \
+                 "https://filebin.net/$BIN_NAME/$encoded_path"
           done
 
           echo ""
