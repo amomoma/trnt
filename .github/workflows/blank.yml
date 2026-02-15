@@ -20,7 +20,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 curl coreutils
+          sudo apt-get install -y aria2 curl coreutils python3
 
       - name: Prepare workspace
         run: |
@@ -90,10 +90,15 @@ jobs:
           BIN_NAME="github-$(date +%s)"
           echo "Uploading to Filebin: $BIN_NAME"
 
-          # Upload each split file to Filebin with the correct names
+          # Loop through each split file and upload with URL-encoded filenames
           for file in *; do
-            echo "Uploading $file ..."
-            curl --progress-bar -T "$file" "https://filebin.net/$BIN_NAME/$file"
+            # URL encode the filename to handle special characters
+            encoded_filename=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$file'''))")
+
+            echo "Uploading $file as $encoded_filename ..."
+
+            # Upload the file with the encoded filename
+            curl --progress-bar -T "$file" "https://filebin.net/$BIN_NAME/$encoded_filename"
           done
 
           echo ""
