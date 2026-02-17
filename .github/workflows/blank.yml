@@ -26,9 +26,10 @@ jobs:
         run: |
           mkdir -p work/download
           mkdir -p work/splits
+          mkdir -p work/logs
 
       - name: Show initial disk space
-        run: df -h
+        run: df -h | tee work/logs/disk_initial.log
 
       - name: Download torrent (Optimized)
         run: |
@@ -50,74 +51,241 @@ jobs:
             --console-log-level=notice \
             "${{ github.event.inputs.torrent_source }}"
 
-          echo "Download finished."
+          if [ $? -eq 0 ]; then
+            echo "✅ Download finished successfully."
+          else
+            echo "❌ Download failed!"
+            exit 1
+          fi
+          
           ls -lh
 
       - name: Show disk usage after download
-        run: df -h
+        run: df -h | tee work/logs/disk_after_download.log
 
-      - name: Direct Split (Recursive, No Compression) + Generate Manifest
+      - name: Direct Split (Recursive, No Compression) + Generate Robust Manifest
         run: |
           cd work
-          echo "Starting recursive split..."
+          echo "Starting recursive split with collision-safe naming..."
 
           # Create manifest file to track original structure
           > splits/MANIFEST.txt
+          > splits/MANIFEST_METADATA.txt
 
-          # Find all files in the 'download' directory and process them
-          find download -type f | while read -r file; do
-            # Remove leading "download/" from path to preserve folder structure
+          # Write metadata header
+          echo "# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > splits/MANIFEST_METADATA.txt
+          echo "# Format: TYPE|HASH|ORIGINAL_PATH|SAFE_NAME" >> splits/MANIFEST_METADATA.txt
+          echo "# TYPE: FILE or EMPTY_DIR" >> splits/MANIFEST_METADATA.txt
+          echo "# HASH: SHA256(first 8 chars) to prevent name collisions" >> splits/MANIFEST_METADATA.txt
+          echo "" >> splits/MANIFEST_METADATA.txt
+
+          file_count=0
+          dir_count=0
+          total_size=0
+
+          # Track empty directories FIRST
+          echo "Scanning for empty directories..."
+          find download -type d -empty | while read -r dir; do
+            rel_path="${dir#download/}"
+            if [ -n "$rel_path" ]; then
+              hash=$(echo -n "$rel_path" | sha256sum | cut -c1-8)
+              echo "EMPTY_DIR|$hash|$rel_path|" >> splits/MANIFEST_METADATA.txt
+              dir_count=$((dir_count + 1))
+              echo "  Empty folder: $rel_path"
+            fi
+          done
+
+          # Find all files and process them
+          echo "Scanning and splitting files..."
+          find download -type f | sort | while read -r file; do
+            # Remove leading "download/" from path
             rel_path="${file#download/}"
 
-            # Convert folder separators (/) to underscores (_) for safe naming
-            safe_name=$(echo "$rel_path" | sed 's|/|_|g')
+            # Generate hash from original path to avoid collisions
+            hash=$(echo -n "$rel_path" | sha256sum | cut -c1-8)
+            
+            # Safe name: hash + sanitized path (/ becomes _)
+            safe_name="${hash}_$(echo "$rel_path" | sed 's|/|_|g')"
 
-            echo "Splitting $rel_path ..."
+            file_size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null)
+            total_size=$((total_size + file_size))
 
-            # Split the file into chunks based on the split_size input
+            echo "Splitting [$file_count] $rel_path ($(numfmt --to=iec-i --suffix=B $file_size 2>/dev/null || du -h "$file" | cut -f1)) ..."
+
+            # Split the file into chunks
             split -b ${{ github.event.inputs.split_size }} \
                   --numeric-suffixes=1 \
                   --suffix-length=4 \
                   "$file" "splits/${safe_name}.part."
 
-            # Record the mapping in manifest: original_path|safe_name
-            echo "$rel_path|${safe_name}" >> splits/MANIFEST.txt
-
-            echo "Deleting original file..."
-            rm "$file"
+            if [ $? -eq 0 ]; then
+              # Count parts created
+              part_count=$(ls "splits/${safe_name}.part."* 2>/dev/null | wc -l)
+              
+              # URL encode the original path for safe storage
+              encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$rel_path', safe=''))")
+              
+              # Record mapping: TYPE|HASH|ENCODED_ORIGINAL_PATH|SAFE_NAME|PART_COUNT
+              echo "FILE|$hash|$encoded_path|${safe_name}|${part_count}" >> splits/MANIFEST_METADATA.txt
+              
+              file_count=$((file_count + 1))
+              echo "  ✅ Created $part_count parts"
+              
+              # Delete original to save space
+              rm "$file"
+            else
+              echo "  ❌ Failed to split $rel_path"
+              exit 1
+            fi
           done
 
+          echo ""
+          echo "======================================"
+          echo "Split Summary:"
+          echo "  Files processed: $file_count"
+          echo "  Empty directories: $dir_count"
+          echo "  Total original size: $(numfmt --to=iec-i --suffix=B $total_size 2>/dev/null || echo $total_size bytes)"
+          echo "======================================"
+          echo ""
           echo "Split parts created:"
-          ls -lh splits
+          ls -lh splits | head -20
+          if [ $(ls splits | wc -l) -gt 20 ]; then
+            echo "... and $(($(ls splits | wc -l) - 20)) more files"
+          fi
 
-      - name: Upload to Filebin (with Manifest and Proper URL Encoding)
+      - name: Validate Manifest
+        run: |
+          cd work/splits
+          
+          echo "Validating manifest..."
+          
+          # Check manifest exists
+          if [ ! -f MANIFEST_METADATA.txt ]; then
+            echo "❌ MANIFEST_METADATA.txt not found!"
+            exit 1
+          fi
+          
+          # Count entries
+          file_entries=$(grep "^FILE|" MANIFEST_METADATA.txt | wc -l)
+          dir_entries=$(grep "^EMPTY_DIR|" MANIFEST_METADATA.txt | wc -l)
+          
+          echo "✅ Manifest validated:"
+          echo "   File entries: $file_entries"
+          echo "   Directory entries: $dir_entries"
+          echo ""
+          echo "First 10 manifest entries:"
+          grep -E "^(FILE|EMPTY_DIR)" MANIFEST_METADATA.txt | head -10
+
+      - name: Show disk usage before upload
+        run: df -h | tee work/logs/disk_before_upload.log
+
+      - name: Upload to Filebin (with Retries and Robust Error Handling)
         run: |
           cd work/splits
           BIN_NAME="github-$(date +%s)"
+          RETRY_COUNT=3
+          RETRY_DELAY=5
+          
           echo "Uploading to Filebin: $BIN_NAME"
-
-          # Upload MANIFEST.txt first (most important!)
-          echo "Uploading MANIFEST.txt..."
-          curl --progress-bar -T "MANIFEST.txt" "https://filebin.net/$BIN_NAME/MANIFEST.txt"
-
+          echo "Retries per file: $RETRY_COUNT"
           echo ""
 
-          # Loop through each split file and upload with proper URL encoding
+          # Function to upload with retry
+          upload_with_retry() {
+            local file=$1
+            local encoded_filename=$2
+            local retries=$RETRY_COUNT
+            
+            while [ $retries -gt 0 ]; do
+              if curl --progress-bar --max-time 300 -T "$file" "https://filebin.net/$BIN_NAME/$encoded_filename" 2>/dev/null; then
+                return 0
+              else
+                retries=$((retries - 1))
+                if [ $retries -gt 0 ]; then
+                  echo ""
+                  echo "⚠️  Upload failed, retrying in ${RETRY_DELAY}s... ($retries attempts left)"
+                  sleep $RETRY_DELAY
+                fi
+              fi
+            done
+            
+            echo ""
+            echo "❌ Failed to upload after $RETRY_COUNT attempts: $file"
+            return 1
+          }
+
+          # Upload MANIFEST_METADATA.txt first (critical!)
+          echo "📋 Uploading manifest (CRITICAL)..."
+          if upload_with_retry "MANIFEST_METADATA.txt" "MANIFEST_METADATA.txt"; then
+            echo "✅ Manifest uploaded successfully"
+          else
+            echo "❌ Failed to upload manifest! Aborting."
+            exit 1
+          fi
+
+          echo ""
+          echo "📦 Uploading split files..."
+          
+          uploaded_count=0
+          failed_count=0
+          total_files=$(ls *.part.* | wc -l)
+
           for file in *.part.*; do
-            # Proper URL encoding: encode ALL special characters including &, =, ?, #, etc.
-            # safe='' means encode everything except alphanumeric and -_.~
+            # Proper URL encoding: encode ALL special characters
             encoded_filename=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$file', safe=''))")
 
-            echo "Uploading $file as $encoded_filename ..."
+            echo -n "[$((uploaded_count + 1))/$total_files] Uploading $file ... "
 
-            # Upload the file with the properly encoded filename
-            curl --progress-bar -T "$file" "https://filebin.net/$BIN_NAME/$encoded_filename"
+            if upload_with_retry "$file" "$encoded_filename"; then
+              uploaded_count=$((uploaded_count + 1))
+              echo "✅"
+            else
+              failed_count=$((failed_count + 1))
+              echo "❌"
+            fi
           done
 
           echo ""
           echo "======================================"
-          echo "✅ Upload complete!"
-          echo "Download link:"
-          echo "https://filebin.net/$BIN_NAME"
+          if [ $failed_count -eq 0 ]; then
+            echo "✅ Upload complete! All files uploaded."
+          else
+            echo "⚠️  Upload partially complete."
+            echo "   Uploaded: $uploaded_count/$total_files"
+            echo "   Failed: $failed_count/$total_files"
+            if [ $failed_count -gt 0 ]; then
+              exit 1
+            fi
+          fi
           echo "======================================"
-          echo "Bin ID: $BIN_NAME"
+          echo ""
+          echo "📥 Download and Restore Instructions:"
+          echo "=================================================="
+          echo "Filebin URL:"
+          echo "https://filebin.net/$BIN_NAME"
+          echo ""
+          echo "Bin ID (shorter):"
+          echo "$BIN_NAME"
+          echo ""
+          echo "Use PowerShell restore script with:"
+          echo ".\restore-torrent.ps1 -BinUrl \"https://filebin.net/$BIN_NAME\""
+          echo "=================================================="
+
+      - name: Verify manifest on Filebin
+        run: |
+          cd work/splits
+          BIN_NAME="github-$(date +%s)"
+          
+          echo "Verifying manifest upload..."
+          sleep 2  # Give filebin time to process
+          
+          manifest_content=$(curl -s "https://filebin.net/$BIN_NAME/MANIFEST_METADATA.txt" 2>/dev/null)
+          
+          if echo "$manifest_content" | grep -q "^FILE|"; then
+            echo "✅ Manifest verified on Filebin!"
+            echo ""
+            echo "Sample manifest entries:"
+            echo "$manifest_content" | grep "^FILE|" | head -5
+          else
+            echo "⚠️  Could not verify manifest (it may still be uploading)"
+          fi
